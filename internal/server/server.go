@@ -555,7 +555,10 @@ func (s *Server) beginUpload(ctx context.Context, src snapshot.SourceInfo) bool 
 	return true
 }
 
-func (s *Server) endUpload(ctx context.Context, src snapshot.SourceInfo, mwe *notifydata.ManifestWithError) {
+// endUpload records the outcome of a finished snapshot. When report is false the snapshot
+// is left out of the notification sent to the user, used for snapshots that were
+// interrupted rather than failed.
+func (s *Server) endUpload(ctx context.Context, src snapshot.SourceInfo, mwe *notifydata.ManifestWithError, report bool) {
 	s.parallelSnapshotsMutex.Lock()
 	defer s.parallelSnapshotsMutex.Unlock()
 
@@ -563,11 +566,16 @@ func (s *Server) endUpload(ctx context.Context, src snapshot.SourceInfo, mwe *no
 
 	s.currentParallelSnapshots--
 
-	s.pendingMultiSnapshotStatus.Snapshots = append(s.pendingMultiSnapshotStatus.Snapshots, mwe)
+	if report {
+		s.pendingMultiSnapshotStatus.Snapshots = append(s.pendingMultiSnapshotStatus.Snapshots, mwe)
+	}
 
 	// send a single snapshot report when last parallel snapshot completes.
 	if s.currentParallelSnapshots == 0 {
-		go s.sendSnapshotReport(s.pendingMultiSnapshotStatus)
+		// nothing to report when every snapshot in this batch was interrupted.
+		if len(s.pendingMultiSnapshotStatus.Snapshots) > 0 {
+			go s.sendSnapshotReport(s.pendingMultiSnapshotStatus)
+		}
 
 		s.pendingMultiSnapshotStatus.Snapshots = nil
 	}
@@ -990,7 +998,13 @@ func (s *Server) runSnapshotTask(ctx context.Context, src snapshot.SourceInfo, i
 
 	result.Manifest.Source = src
 
-	defer s.endUpload(ctx, src, &result)
+	// snapshots cut short by the machine going to sleep are retried, so they are excluded
+	// from the notification sent to the user rather than reported as errors.
+	reportResult := true
+
+	defer func() {
+		s.endUpload(ctx, src, &result, reportResult)
+	}()
 
 	err := errors.Wrap(s.taskmgr.Run(
 		ctx,
@@ -1000,6 +1014,14 @@ func (s *Server) runSnapshotTask(ctx context.Context, src snapshot.SourceInfo, i
 			return inner(ctx, ctrl, &result)
 		}), "snapshot task")
 	if err != nil {
+		if errors.Is(err, errInterruptedBySuspend) {
+			userLog(ctx).Infof("snapshot of %v was interrupted by the machine going to sleep and will be retried: %v", src, err)
+
+			reportResult = false
+
+			return err
+		}
+
 		result.Error = err.Error()
 	}
 
