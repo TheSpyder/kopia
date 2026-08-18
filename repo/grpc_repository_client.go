@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/gather"
@@ -48,6 +49,11 @@ const (
 
 	// number of manifests to fetch in a single batch.
 	defaultFindManifestsPageSize = 1000
+
+	// how often to ping the server while a session stream is open, and how long to wait
+	// for the reply before declaring the connection dead.
+	keepaliveTime    = 30 * time.Second
+	keepaliveTimeout = 20 * time.Second
 )
 
 var errShouldRetry = errors.New("should retry")
@@ -900,6 +906,16 @@ func openGRPCAPIRepository(ctx context.Context, si *APIServerInfo, password stri
 		uri,
 		grpc.WithPerRPCCredentials(grpcCreds{par.cliOpts.Hostname, par.cliOpts.Username, password}),
 		grpc.WithTransportCredentials(transportCreds),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			// detect connections that died while the machine was asleep or the network
+			// dropped; without keepalive that takes until the OS gives up on the
+			// connection, which can be many minutes of apparent hang before an EOF.
+			Time:    keepaliveTime,
+			Timeout: keepaliveTimeout,
+
+			// only ping while a session stream is open, so an idle client stays quiet.
+			PermitWithoutStream: false,
+		}),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(MaxGRPCMessageSize),
