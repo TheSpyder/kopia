@@ -13,6 +13,7 @@ import (
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/powerassert"
 	"github.com/kopia/kopia/internal/serverapi"
+	"github.com/kopia/kopia/internal/suspendwatch"
 	"github.com/kopia/kopia/internal/uitask"
 	"github.com/kopia/kopia/notification/notifydata"
 	"github.com/kopia/kopia/repo"
@@ -25,6 +26,12 @@ const (
 	failedSnapshotRetryInterval = 5 * time.Minute
 	refreshTimeout              = 30 * time.Second // max amount of time to refresh a single source
 )
+
+// errInterruptedBySuspend wraps the failure of a snapshot that was still running when the
+// machine went to sleep. Such a snapshot did not really fail - it was cut short, its network
+// connections were torn down under it, and it will be retried - so it is reported to the user
+// as an interruption rather than as an error.
+var errInterruptedBySuspend = errors.New("snapshot interrupted by system sleep")
 
 type sourceManagerServerInterface interface {
 	runSnapshotTask(ctx context.Context, src snapshot.SourceInfo, inner func(ctx context.Context, ctrl uitask.Controller, result *notifydata.ManifestWithError) error) error
@@ -324,6 +331,11 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 	releasePowerAssertion := powerassert.Hold(ctx, "kopia is snapshotting "+s.src.String())
 	defer releasePowerAssertion()
 
+	// the assertion is not a guarantee - nothing in user space can stop an explicit sleep -
+	// so also notice when we lost the race, to tell a genuine failure apart from a snapshot
+	// that was simply cut in half by the machine sleeping.
+	suspend := suspendwatch.Start()
+
 	// check if we got closed while waiting on semaphore
 	select {
 	case <-s.closed:
@@ -349,8 +361,7 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 		result.Previous = manifestsSinceLastCompleteSnapshot[0]
 	}
 
-	//nolint:wrapcheck
-	return repo.WriteSession(ctx, s.rep, repo.WriteSessionOptions{
+	err = repo.WriteSession(ctx, s.rep, repo.WriteSessionOptions{
 		Purpose: "Source Manager Uploader",
 		OnUpload: func(numBytes int64) {
 			// extra indirection to allow changing onUpload function later
@@ -414,6 +425,18 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 
 		return nil
 	})
+
+	return wrapIfInterruptedBySuspend(err, suspend)
+}
+
+// wrapIfInterruptedBySuspend reports a failed snapshot as an interruption rather than an
+// error when the machine was asleep while it was running.
+func wrapIfInterruptedBySuspend(err error, suspend suspendwatch.Watch) error {
+	if err != nil && suspend.DidSuspend() {
+		return errors.Wrapf(errInterruptedBySuspend, "%v (machine was asleep for %v)", err, suspend.Suspended().Round(time.Second))
+	}
+
+	return err
 }
 
 // +checklocksread:s.sourceMutex
