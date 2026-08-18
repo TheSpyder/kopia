@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/powerassert"
 	"github.com/kopia/kopia/internal/serverapi"
+	"github.com/kopia/kopia/internal/suspendwatch"
 	"github.com/kopia/kopia/internal/uitask"
 	"github.com/kopia/kopia/notification/notifydata"
 	"github.com/kopia/kopia/repo"
@@ -25,6 +27,11 @@ const (
 	failedSnapshotRetryInterval = 5 * time.Minute
 	refreshTimeout              = 30 * time.Second // max amount of time to refresh a single source
 )
+
+// errInterruptedBySuspend wraps the failure of a snapshot that was still running when the
+// machine went to sleep. Such a snapshot will be retried, so it is reported as an
+// interruption rather than an error.
+var errInterruptedBySuspend = errors.New("snapshot interrupted by system sleep")
 
 type sourceManagerServerInterface interface {
 	runSnapshotTask(ctx context.Context, src snapshot.SourceInfo, inner func(ctx context.Context, ctrl uitask.Controller, result *notifydata.ManifestWithError) error) error
@@ -200,9 +207,11 @@ func (s *sourceManager) runLocal(ctx context.Context) {
 			userLog(ctx).Debugw("snapshotting", "source", s.src)
 
 			if err := s.server.runSnapshotTask(ctx, s.src, s.snapshotInternal); err != nil {
-				userLog(ctx).Errorf("snapshot error: %v", err)
+				if shouldBackoffAfter(err) {
+					userLog(ctx).Errorf("snapshot error: %v", err)
 
-				s.backoffBeforeNextSnapshot()
+					s.backoffBeforeNextSnapshot()
+				}
 			} else {
 				s.refreshStatus(ctx)
 			}
@@ -212,6 +221,14 @@ func (s *sourceManager) runLocal(ctx context.Context) {
 			s.setStatus("IDLE")
 		}
 	}
+}
+
+// shouldBackoffAfter reports whether a failed snapshot should delay the next attempt and
+// be logged as an error. A snapshot interrupted by sleep should do neither: it has already
+// been logged as an interruption, and a five minute delay would land the retry after a
+// sleeping laptop is asleep again, with each attempt re-arming the same delay.
+func shouldBackoffAfter(err error) bool {
+	return err != nil && !errors.Is(err, errInterruptedBySuspend)
 }
 
 func (s *sourceManager) backoffBeforeNextSnapshot() {
@@ -324,6 +341,10 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 	releasePowerAssertion := powerassert.Hold(ctx, "kopia is snapshotting "+s.src.String())
 	defer releasePowerAssertion()
 
+	// the assertion cannot stop an explicit sleep, so also detect when the machine slept
+	// anyway, to tell a genuine failure apart from an interrupted snapshot.
+	suspend := suspendwatch.Start()
+
 	// check if we got closed while waiting on semaphore
 	select {
 	case <-s.closed:
@@ -349,8 +370,7 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 		result.Previous = manifestsSinceLastCompleteSnapshot[0]
 	}
 
-	//nolint:wrapcheck
-	return repo.WriteSession(ctx, s.rep, repo.WriteSessionOptions{
+	err = repo.WriteSession(ctx, s.rep, repo.WriteSessionOptions{
 		Purpose: "Source Manager Uploader",
 		OnUpload: func(numBytes int64) {
 			// extra indirection to allow changing onUpload function later
@@ -414,7 +434,50 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 
 		return nil
 	})
+
+	return reportInterruption(err, suspend, ctrl)
 }
+
+// reportInterruption turns a failure that spans a suspend into an interruption and marks
+// the task so it is reported as canceled rather than failed. This has to run while the
+// task is still going: by the time runSnapshotTask sees the error it has been completed.
+func reportInterruption(err error, suspend suspendwatch.Watch, ctrl uitask.Controller) error {
+	err = wrapIfInterruptedBySuspend(err, suspend)
+
+	if errors.Is(err, errInterruptedBySuspend) {
+		ctrl.MarkInterrupted()
+	}
+
+	return err
+}
+
+// wrapIfInterruptedBySuspend reports a failed snapshot as an interruption rather than an
+// error when the machine was asleep while it was running.
+func wrapIfInterruptedBySuspend(err error, suspend suspendwatch.Watch) error {
+	if err != nil && suspend.DidSuspend() {
+		return &interruptedBySuspendError{cause: err, slept: suspend.Suspended().Round(time.Second)}
+	}
+
+	return err
+}
+
+// interruptedBySuspendError reports a snapshot cut short by the machine sleeping. It leads
+// with the interruption rather than trailing it: this text appears against the task in the
+// UI, where a message opening with an EOF reads as an unexplained failure.
+type interruptedBySuspendError struct {
+	cause error
+	slept time.Duration
+}
+
+func (e *interruptedBySuspendError) Error() string {
+	return fmt.Sprintf("snapshot interrupted by system sleep after %v: %v", e.slept, e.cause)
+}
+
+// Unwrap keeps the original failure in the chain.
+func (e *interruptedBySuspendError) Unwrap() error { return e.cause }
+
+// Is matches the sentinel, so existing errors.Is checks keep working.
+func (e *interruptedBySuspendError) Is(target error) bool { return target == errInterruptedBySuspend }
 
 // +checklocksread:s.sourceMutex
 func (s *sourceManager) findClosestNextSnapshotTimeReadLocked() *time.Time {
