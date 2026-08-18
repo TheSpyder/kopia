@@ -13,6 +13,7 @@ import (
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/fs/localfs"
 	"github.com/kopia/kopia/fs/virtualfs"
+	"github.com/kopia/kopia/internal/powerassert"
 	"github.com/kopia/kopia/notification"
 	"github.com/kopia/kopia/notification/notifydata"
 	"github.com/kopia/kopia/repo"
@@ -126,6 +127,12 @@ func (c *commandSnapshotCreate) run(ctx context.Context, rep repo.RepositoryWrit
 	if len(c.snapshotCreateDescription) > maxSnapshotDescriptionLength {
 		return errors.New("description too long")
 	}
+
+	// keep the machine awake for the duration of the snapshot; scheduled snapshots often
+	// start during a brief maintenance wake and would otherwise fail when the machine goes
+	// back to sleep mid-upload.
+	releasePowerAssertion := powerassert.Hold(ctx, "kopia is creating a snapshot")
+	defer releasePowerAssertion()
 
 	localfsOpts := localfs.Options{StreamingReads: c.snapshotCreateStreamingReads}
 
