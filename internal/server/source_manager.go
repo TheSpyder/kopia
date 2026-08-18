@@ -11,6 +11,7 @@ import (
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/fs/localfs"
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/powerassert"
 	"github.com/kopia/kopia/internal/serverapi"
 	"github.com/kopia/kopia/internal/uitask"
 	"github.com/kopia/kopia/notification/notifydata"
@@ -316,6 +317,12 @@ func (s *sourceManager) snapshotInternal(ctx context.Context, ctrl uitask.Contro
 
 	s.setCurrentTaskID(ctrl.CurrentTaskID())
 	defer s.setCurrentTaskID("")
+
+	// keep the machine awake until the snapshot is done; scheduled snapshots often start
+	// during a brief maintenance wake and would otherwise fail when the machine goes back
+	// to sleep mid-upload.
+	releasePowerAssertion := powerassert.Hold(ctx, "kopia is snapshotting "+s.src.String())
+	defer releasePowerAssertion()
 
 	// check if we got closed while waiting on semaphore
 	select {
