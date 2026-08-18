@@ -13,6 +13,7 @@ import (
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/fs/localfs"
 	"github.com/kopia/kopia/fs/virtualfs"
+	"github.com/kopia/kopia/internal/powerassert"
 	"github.com/kopia/kopia/notification"
 	"github.com/kopia/kopia/notification/notifydata"
 	"github.com/kopia/kopia/repo"
@@ -126,6 +127,10 @@ func (c *commandSnapshotCreate) run(ctx context.Context, rep repo.RepositoryWrit
 	if len(c.snapshotCreateDescription) > maxSnapshotDescriptionLength {
 		return errors.New("description too long")
 	}
+
+	// Grab the power assertion and hold it for the duration of the snapshot
+	releasePowerAssertion := powerassert.Hold(ctx, "kopia is creating a snapshot")
+	defer releasePowerAssertion()
 
 	localfsOpts := localfs.Options{StreamingReads: c.snapshotCreateStreamingReads}
 
