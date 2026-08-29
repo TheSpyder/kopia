@@ -40,6 +40,12 @@ type Manager struct {
 type Controller interface {
 	CurrentTaskID() string
 	OnCancel(cancelFunc context.CancelFunc)
+
+	// MarkInterrupted records that the task stopped because of an external event
+	// rather than a defect, and is reported as canceled rather than failed. Must be
+	// called before the task function returns.
+	MarkInterrupted()
+
 	ReportCounters(counters map[string]CounterValue)
 	ReportProgressInfo(text string)
 }
