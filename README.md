@@ -1,3 +1,12 @@
+> **Fork note:** this fork carries the changes on the
+> [`macos-sleep-handling`](https://github.com/TheSpyder/kopia/pull/1)
+> branch while they are discussed upstream. The CI artifact builds are not signed or
+> notarized, so macOS refuses to run them until the quarantine attribute is removed:
+>
+> ```
+> xattr -rd com.apple.quarantine /Applications/KopiaUI.app
+> ```
+
 Kopia
 =====
 
