@@ -94,6 +94,19 @@ func (t *runningTaskInfo) OnCancel(f context.CancelFunc) {
 	}
 }
 
+// MarkInterrupted implements the Controller interface.
+//
+// Unlike cancel() this does not run the cancellation functions: the work has already
+// stopped, and firing them would cancel a context the task is still unwinding through.
+func (t *runningTaskInfo) MarkInterrupted() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.Status == StatusRunning {
+		t.Status = StatusCanceling
+	}
+}
+
 func (t *runningTaskInfo) cancel() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
